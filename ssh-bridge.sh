@@ -953,8 +953,38 @@ health_local_cmd() {
         local remote_color="never"
         [[ -n "$HEALTH_GREEN" ]] && remote_color="always"
         health_header "Remote host: $host"
-        health_pass "bootstrap" "install/update requested via LocalCommand path"
-        local_command_cmd "$host" || true
+
+        # Check SSH config integration
+        local ssh_g_output permit_local_cmd local_cmd
+        ssh_g_output="$(ssh -G "$host" 2>/dev/null || true)"
+        permit_local_cmd="$(printf '%s\n' "$ssh_g_output" | awk '$1 == "permitlocalcommand" { print $2 }' || true)"
+        local_cmd="$(printf '%s\n' "$ssh_g_output" | awk '$1 == "localcommand" { $1=""; print $0 }' | sed 's/^ //' || true)"
+
+        local config_ok=1
+        if [[ "$permit_local_cmd" != "yes" ]]; then
+            config_ok=0
+            health_fail "ssh PermitLocalCommand" "set to '$permit_local_cmd', must be 'yes'"
+        else
+            health_pass "ssh PermitLocalCommand" "yes"
+        fi
+
+        if [[ -z "$local_cmd" ]]; then
+            config_ok=0
+            health_fail "ssh LocalCommand" "missing or empty"
+        elif [[ "$local_cmd" != *"ss-bridge local-command"* && "$local_cmd" != *"ssh-bridge.sh local-command"* ]]; then
+            config_ok=0
+            health_fail "ssh LocalCommand" "does not invoke local-command (found: '$local_cmd')"
+        else
+            health_pass "ssh LocalCommand" "$local_cmd"
+        fi
+
+        if (( config_ok )); then
+            health_pass "bootstrap" "install/update requested via LocalCommand path"
+            local_command_cmd "$host" || true
+        else
+            health_fail "bootstrap" "skipped because LocalCommand is not configured in ~/.ssh/config"
+        fi
+
         if ssh \
             -o PermitLocalCommand=no \
             -o LocalCommand=true \
