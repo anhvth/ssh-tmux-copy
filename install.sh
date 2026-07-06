@@ -285,7 +285,25 @@ clipsync-ensure() {
 ssh() {
     local host
     host="$(_clipsync_target "$@")" && clipsync-ensure "$host"
-    command ssh "$@"
+    command env -u LC_ALL -u LC_CTYPE ssh "$@"
+    local rc=$?
+
+    if (( rc == 255 )); then
+        local arg
+        for arg in "$@"; do
+            case "$arg" in
+                -v|-vv|-vvv|-vvvv|-*v*)
+                    return "$rc"
+                    ;;
+            esac
+        done
+
+        printf 'ssh failed with exit code 255; retrying once with -vvv diagnostics...\n' >&2
+        command env -u LC_ALL -u LC_CTYPE ssh -vvv "$@"
+        return $?
+    fi
+
+    return "$rc"
 }
 
 clipsync-status() {
