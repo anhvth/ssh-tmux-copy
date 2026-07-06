@@ -168,11 +168,17 @@ echo "clipsync: watching /tmp/tmux_copy_text_select on $host — Ctrl+C to stop"
 # shellcheck disable=SC2087
 ssh -o ServerAliveInterval=30 -T "$host" bash -s <<'REMOTE' |
 FILE=/tmp/tmux_copy_text_select
+INTERVAL="${CLIPSYNC_REMOTE_POLL_INTERVAL:-1}"
 b64() { base64 -w0 "$FILE" 2>/dev/null || base64 "$FILE" | tr -d '\n'; }
 sum() { cksum "$FILE" 2>/dev/null || echo missing; }
 last="$(sum)"   # skip whatever was copied before we connected
 while :; do
-  sleep 0.2
+  if command -v inotifywait >/dev/null 2>&1; then
+    inotifywait -qq -e close_write -e moved_to -e create /tmp --include 'tmux_copy_text_select' 2>/dev/null \
+      || sleep "$INTERVAL"
+  else
+    sleep "$INTERVAL"
+  fi
   cur="$(sum)"
   if [ "$cur" != "$last" ] && [ "$cur" != missing ]; then
     last="$cur"
@@ -243,6 +249,9 @@ write_ssh_wrapper() {
 
 CLIPSYNC_TMUX_SOCKET="${CLIPSYNC_TMUX_SOCKET:-tmux}"
 CLIPSYNC_TMUX_SESSION="${CLIPSYNC_TMUX_SESSION:-tmux-sync-clipboard}"
+CLIPSYNC_AUTO_START="${CLIPSYNC_AUTO_START:-0}"
+CLIPSYNC_RESTART_COOLDOWN="${CLIPSYNC_RESTART_COOLDOWN:-60}"
+SSH_DIAGNOSTIC_RETRY="${SSH_DIAGNOSTIC_RETRY:-0}"
 
 # First non-option arg = ssh destination (skips option flags that take a value)
 _clipsync_target() {
@@ -274,21 +283,52 @@ clipsync-ensure() {
             -F '#{window_name}' 2>/dev/null | grep -qx -- "$host"; then
         return 0
     fi
-    local cmd="$HOME/.ssh-tmux-copy/bin/clipsync '$host'; echo 'clipsync exited'; sleep 10"
+
+    local state_dir key lock_dir stamp now last qhost cmd
+    state_dir="${TMPDIR:-/tmp}/ssh-tmux-copy-${UID:-$(id -u)}"
+    mkdir -p "$state_dir" 2>/dev/null || return 0
+    key="$(printf '%s' "$host" | cksum | awk '{print $1}')"
+    lock_dir="$state_dir/clipsync-$key.lock"
+    stamp="$state_dir/clipsync-$key.last"
+
+    if ! mkdir "$lock_dir" 2>/dev/null; then
+        return 0
+    fi
+
+    now="$(date +%s)"
+    last="$(cat "$stamp" 2>/dev/null || printf 0)"
+    if (( now - last < CLIPSYNC_RESTART_COOLDOWN )); then
+        rmdir "$lock_dir" 2>/dev/null || true
+        return 0
+    fi
+    printf '%s\n' "$now" > "$stamp" 2>/dev/null || true
+
+    # Check again after taking the lock to avoid duplicate tmux windows.
+    if tmux -L "$CLIPSYNC_TMUX_SOCKET" list-windows -t "$CLIPSYNC_TMUX_SESSION" \
+            -F '#{window_name}' 2>/dev/null | grep -qx -- "$host"; then
+        rmdir "$lock_dir" 2>/dev/null || true
+        return 0
+    fi
+
+    qhost="$(printf '%q' "$host")"
+    cmd="$HOME/.ssh-tmux-copy/bin/clipsync $qhost; echo 'clipsync exited'; sleep 10"
     if tmux -L "$CLIPSYNC_TMUX_SOCKET" has-session -t "$CLIPSYNC_TMUX_SESSION" 2>/dev/null; then
         tmux -L "$CLIPSYNC_TMUX_SOCKET" new-window -d -t "$CLIPSYNC_TMUX_SESSION" -n "$host" "$cmd"
     else
         tmux -L "$CLIPSYNC_TMUX_SOCKET" new-session -d -s "$CLIPSYNC_TMUX_SESSION" -n "$host" "$cmd"
     fi
+    rmdir "$lock_dir" 2>/dev/null || true
 }
 
 ssh() {
     local host
-    host="$(_clipsync_target "$@")" && clipsync-ensure "$host"
+    if [[ "$CLIPSYNC_AUTO_START" == 1 || "$CLIPSYNC_AUTO_START" == true || "$CLIPSYNC_AUTO_START" == yes ]]; then
+        host="$(_clipsync_target "$@")" && clipsync-ensure "$host"
+    fi
     command env -u LC_ALL -u LC_CTYPE ssh "$@"
     local rc=$?
 
-    if (( rc == 255 )); then
+    if (( rc == 255 )) && [[ "$SSH_DIAGNOSTIC_RETRY" == 1 || "$SSH_DIAGNOSTIC_RETRY" == true || "$SSH_DIAGNOSTIC_RETRY" == yes ]]; then
         local arg
         for arg in "$@"; do
             case "$arg" in
@@ -309,6 +349,15 @@ ssh() {
 clipsync-status() {
     tmux -L "$CLIPSYNC_TMUX_SOCKET" list-windows -t "$CLIPSYNC_TMUX_SESSION" \
         -F 'clipsync -> #{window_name}' 2>/dev/null || echo "clipsync: not running"
+}
+
+clipsync-start() {
+    local host
+    host="$(_clipsync_target "$@")" || {
+        printf 'usage: clipsync-start <ssh-host>\n' >&2
+        return 2
+    }
+    clipsync-ensure "$host"
 }
 
 clipsync-stop() {
